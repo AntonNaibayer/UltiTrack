@@ -1,0 +1,36 @@
+[project]
+name = "ultitrack"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "AntonNaibayer", email = "anton.naubayer@gmail.com" }
+]
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "lap>=0.5.14",
+    "opencv-python>=5.0.0.93",
+    "scikit-learn>=1.9.1",
+    "supervision>=0.31.7",
+    "torch>=2.4.0",
+    "torchvision>=0.19.0",
+    "trackers>=2.7.0",
+    "ultralytics>=8.4.213",
+]
+
+[project.scripts]
+ultitrack = "ultitrack:main"
+
+[build-system]
+requires = ["uv_build>=0.11.17,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+
+
