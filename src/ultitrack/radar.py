@@ -3,6 +3,8 @@ from collections import deque
 import cv2
 import numpy as np
 
+from ultitrack.config import ENDZONE_LENGTH, FIELD_LENGTH, FIELD_WIDTH
+
 
 class OneEuroFilter:
     """Изотропный адаптивный фильтр для сглаживания 2D-координат (без разъезда осей X/Y)."""
@@ -63,8 +65,9 @@ class TacticalRadar:
         self.w_px = width * self.ssaa
         self.h_px = height * self.ssaa
 
-        self.scale_x = self.w_px / 20.0
-        self.scale_y = self.h_px / 40.0
+        # Используем размеры из конфига
+        self.scale_x = self.w_px / FIELD_WIDTH
+        self.scale_y = self.h_px / FIELD_LENGTH
 
         self.filters: dict[int, OneEuroFilter] = {}
         self.trails: dict[int, deque[tuple[int, int]]] = {}
@@ -76,12 +79,13 @@ class TacticalRadar:
         pitch = np.full((self.h_px, self.w_px, 3), (45, 110, 65), dtype=np.uint8)
         cv2.rectangle(pitch, (0, 0), (self.w_px - 1, self.h_px - 1), (255, 255, 255), 2 * self.ssaa, cv2.LINE_AA)
 
-        far_ez_y = int(6.0 * self.scale_y)
-        near_ez_y = int(34.0 * self.scale_y)
+        # Рисуем эндзоны и центр по конфигу
+        far_ez_y = int(ENDZONE_LENGTH * self.scale_y)
+        near_ez_y = int((FIELD_LENGTH - ENDZONE_LENGTH) * self.scale_y)
         cv2.line(pitch, (0, far_ez_y), (self.w_px, far_ez_y), (255, 255, 255), 2 * self.ssaa, cv2.LINE_AA)
         cv2.line(pitch, (0, near_ez_y), (self.w_px, near_ez_y), (255, 255, 255), 2 * self.ssaa, cv2.LINE_AA)
 
-        mid_y = int(20.0 * self.scale_y)
+        mid_y = int((FIELD_LENGTH / 2.0) * self.scale_y)
         cv2.line(pitch, (0, mid_y), (self.w_px, mid_y), (200, 230, 200), 1 * self.ssaa, cv2.LINE_AA)
         return pitch
 
@@ -115,6 +119,7 @@ class TacticalRadar:
                     pos = raw_pos
 
                 x_m, y_m = float(pos[0]), float(pos[1])
+                # int(round(...)) для суб-пиксельной плавности
                 px = int(round(np.clip(x_m * self.scale_x, 6 * self.ssaa, self.w_px - 7 * self.ssaa)))
                 py = int(round(np.clip(y_m * self.scale_y, 6 * self.ssaa, self.h_px - 7 * self.ssaa)))
 

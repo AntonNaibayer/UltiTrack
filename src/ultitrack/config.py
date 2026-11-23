@@ -19,3 +19,8 @@ IMAGE_SIZE = 1280
 
 # 0 — disc, 1 — player
 TARGET_CLASSES = [0, 1]
+
+# Размеры поля в метрах (можно менять под конкретный зал)
+FIELD_WIDTH = 20.0
+FIELD_LENGTH = 41.0
+ENDZONE_LENGTH = 7.0

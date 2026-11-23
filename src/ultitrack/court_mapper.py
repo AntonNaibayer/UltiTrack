@@ -23,7 +23,7 @@ import cv2
 import numpy as np
 import supervision as sv
 
-from ultitrack.config import ROOT_DIR
+from ultitrack.config import ENDZONE_LENGTH, FIELD_LENGTH, FIELD_WIDTH, ROOT_DIR
 from ultitrack.lens import DivisionLens
 
 CALIB_DIR = ROOT_DIR / "calib"
@@ -32,8 +32,8 @@ POINTS_PATH = CALIB_DIR / "court_points.json"
 HOMOGRAPHY_PATH = CALIB_DIR / "homography.json"
 FIELD_POLYGON_PATH = CALIB_DIR / "field_polygon.json"
 
-FIELD_W, FIELD_L = 20.0, 40.0
-ENDZONE = 6.0
+FIELD_W, FIELD_L = FIELD_WIDTH, FIELD_LENGTH
+ENDZONE = ENDZONE_LENGTH
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 # Стороны, где стена стоит прямо у линии (выход за линию — ошибка проекции, а не аут):

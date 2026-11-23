@@ -145,4 +145,4 @@ def run_pipeline(video_filename: str) -> None:
 
 
 if __name__ == "__main__":
-    run_pipeline("match6.mp4")
+    run_pipeline("match5.mp4")

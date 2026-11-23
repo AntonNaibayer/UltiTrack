@@ -10,6 +10,7 @@ import numpy as np
 import supervision as sv
 from scipy.optimize import linear_sum_assignment
 
+from ultitrack.config import ENDZONE_LENGTH, FIELD_LENGTH, FIELD_WIDTH
 from ultitrack.court_mapper import FIELD_L, FIELD_W, CourtMapper
 
 # ---------- константы ----------
@@ -206,11 +207,13 @@ class RosterTracker:
             d_idx = tid_to_det[slot.tracker_id]
             if d_idx in used_dets:
                 continue
-            if s_idx in crowded_slots or max_iou_per_det[d_idx] > 0.15:
+                
+            # Разрешаем матчинг при перекрытии до 45% (чтобы не терять в толпе)
+            if max_iou_per_det[d_idx] > 0.45:
                 continue
 
             pred = slot.pred_pos
-            if float(np.linalg.norm(det_coords[d_idx] - pred)) <= 3.0:
+            if float(np.linalg.norm(det_coords[d_idx] - pred)) <= 3.5:
                 slot_in = (0 <= slot.anchor_pos[0] <= FIELD_W) and (0 <= slot.anchor_pos[1] <= FIELD_L)
                 if slot_in and not in_strict[d_idx] and float(np.linalg.norm(det_coords[d_idx] - slot.anchor_pos)) > 2.0:
                     continue
@@ -218,7 +221,7 @@ class RosterTracker:
                 matched[s_idx] = d_idx
                 used_dets.add(d_idx)
 
-        # Шаг 2: венгерский алгоритм по свободным слотам и детекциям
+        # Шаг 2: венгерский алгоритм
         free_s = [s for s in range(len(self.slots)) if s not in matched]
         free_d = [d for d in range(len(detections)) if d not in used_dets]
 
@@ -250,7 +253,6 @@ class RosterTracker:
 
                     cost = dist * 14.0 + traj_pen
 
-                    # --- ЖЕСТКИЙ ШТРАФ ЗА БРОВКУ ---
                     if not in_strict[d_idx]:
                         if slot_in:
                             cost += 10000.0
@@ -286,10 +288,9 @@ class RosterTracker:
         dt = 1.0 / self.fps
         max_step = MAX_PLAYER_SPEED_MPS * dt
 
-        # 0) ПРЕДСКАЗАНИЕ КАЛМАНА (один раз на кадр)
+        # 0) ПРЕДСКАЗАНИЕ КАЛМАНА
         for slot in self.slots:
             if slot.frames_lost > 0:
-                # Плавно гасим инерцию при потере, чтобы фишка не улетала далеко
                 slot.kf.statePost[2:4] *= 0.85
 
             pred = slot.kf.predict()
@@ -303,7 +304,7 @@ class RosterTracker:
             in_strict_raw, in_buffer = court_mapper.get_field_masks(
                 detections,
                 strict_margin_m=0.0,
-                buffer_margin_m=0.5,
+                buffer_margin_m=0.9, # Вернули нормальный буфер
                 drop_cut_feet=False,
             )
             in_buffer = np.asarray(in_buffer, dtype=bool)
@@ -331,7 +332,7 @@ class RosterTracker:
         else:
             matched_det_indices = {}
 
-        # 3) Диагностика и RESPAWN давно пропавшего слота
+        # 3) RESPAWN
         used_dets = set(matched_det_indices.values())
         spare_idx = [i for i in range(len(detections)) if i not in used_dets]
 
@@ -375,8 +376,9 @@ class RosterTracker:
 
                 matched_det_indices[dead_slot_idx] = d_idx
                 spare_idx.remove(d_idx)
+                print(f"[Roster] RESPAWN: Слот #{slot.slot_id} переназначен на игрока ID={slot.tracker_id}")
 
-        # 4) Обновление позиций
+        # 4) Обновление позиций (без фикса ног, как договорились)
         kept_det_indices: list[int] = []
         matched_slot_ids: list[int] = []
         assigned_slot_ids: list[int] = []
@@ -396,7 +398,6 @@ class RosterTracker:
                 slot.pos_history.append(new_pos)
                 smooth_vel = self._compute_smooth_velocity(slot.pos_history)
 
-                # Шум измерений зависит от дистанции (высоты бокса), а не от скачущего conf
                 box_h = max(20.0, float(detections.xyxy[d_idx][3] - detections.xyxy[d_idx][1]))
                 dist_scale = float(np.clip((120.0 / box_h) ** 2, 0.5, 4.0))
                 slot.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * (0.20 * dist_scale)
@@ -406,14 +407,14 @@ class RosterTracker:
 
                 slot.pos_2d = slot.kf.statePost[:2].flatten()
 
-                # Лимит шага за кадр (защита от телепортаций и резких выбросов)
+                # Лимит шага за кадр
                 step_vec = slot.pos_2d - slot.prev_pos
                 step_dist = float(np.linalg.norm(step_vec))
                 if step_dist > max_step:
                     slot.pos_2d = slot.prev_pos + (step_vec / step_dist) * max_step
                     slot.kf.statePost[:2] = slot.pos_2d.reshape(2, 1)
 
-                # Ограничиваем модуль внутренней скорости в Калмане физическим пределом
+                # Ограничение скорости
                 vel = slot.kf.statePost[2:4].flatten()
                 vel_norm = float(np.linalg.norm(vel))
                 if vel_norm > MAX_PLAYER_SPEED_MPS:
@@ -432,11 +433,10 @@ class RosterTracker:
                 matched_slot_ids.append(slot.slot_id)
                 assigned_slot_ids.append(slot.slot_id)
                 smoothed_coords.append(slot.pos_2d.copy())
-                status_array.append(1)  # Активен
+                status_array.append(1) 
                 self._last_matched_telemetry.append((slot.slot_id, slot.pos_2d.copy()))
             else:
                 slot.frames_lost += 1
-                # Без измерения переносим предсказанное состояние и ковариацию в Post
                 slot.kf.statePost = slot.kf.statePre.copy()
                 slot.kf.errorCovPost = slot.kf.errorCovPre.copy()
 
@@ -529,7 +529,11 @@ class RosterTracker:
             "meta": {
                 "point_id": point_id,
                 "fps": round(self.fps, 2),
-                "field": {"width": 20.0, "length": 40.0, "endzone": 6.0},
+                "field": {
+                    "width": FIELD_WIDTH, 
+                    "length": FIELD_LENGTH, 
+                    "endzone": ENDZONE_LENGTH
+                },
             },
             "frames": self.telemetry_frames,
         }
