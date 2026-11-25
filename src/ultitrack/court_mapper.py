@@ -12,8 +12,10 @@
   * добавлены строгая и буферная маски поля для гистерезис-фильтрации игроков на бровке;
   * добавлена поддержка сторон со стеной у линии (не считаются аутом, координата прижимается к линии).
 
-Система координат: поле 20 x 40 м, x - поперёк (0..20), y - вдоль (0..40),
-энд-зоны по 6 м (y = 0..6 и y = 34..40). Калибровочные точки могут лежать и вне поля.
+Система координат: x - поперёк (0..FIELD_W), y - вдоль (0..FIELD_L),
+энд-зоны по ENDZONE м с обеих сторон. Размеры поля, эндзон и отступы стен
+читаются из calib/venue.json (см. ultitrack.config.load_venue), поэтому для другого
+зала достаточно поменять JSON, а не код. Калибровочные точки могут лежать и вне поля.
 """
 
 import json
@@ -23,7 +25,13 @@ import cv2
 import numpy as np
 import supervision as sv
 
-from ultitrack.config import ENDZONE_LENGTH, FIELD_LENGTH, FIELD_WIDTH, ROOT_DIR
+from ultitrack.config import (
+    ENDZONE_LENGTH,
+    FIELD_LENGTH,
+    FIELD_WIDTH,
+    ROOT_DIR,
+    WALL_NO_OUT_MARGINS_M,
+)
 from ultitrack.lens import DivisionLens
 
 CALIB_DIR = ROOT_DIR / "calib"
@@ -37,13 +45,9 @@ ENDZONE = ENDZONE_LENGTH
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 # Стороны, где стена стоит прямо у линии (выход за линию — ошибка проекции, а не аут):
-# left -> x = 0 (стена с окнами), right -> x = 20, far -> y = 0, near -> y = 40.
-WALL_NO_OUT_MARGINS_M: dict[str, float] = {
-    "left": 3.0,
-    "right": 0.0,
-    "far": 0.0,
-    "near": 0.0,
-}
+# left -> x = 0 (стена с окнами), right -> x = FIELD_WIDTH, far -> y = 0,
+# near -> y = FIELD_LENGTH. Значения приходят из calib/venue.json.
+# Константа реэкспортируется для обратной совместимости импортов.
 
 
 class CourtMapper:

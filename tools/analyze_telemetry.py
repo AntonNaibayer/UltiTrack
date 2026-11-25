@@ -68,7 +68,12 @@ def analyze(path: str) -> dict:
     present: dict[int, np.ndarray] = collections.defaultdict(lambda: np.zeros(n, dtype=bool))
     for i, f in enumerate(frames):
         for p in f["players"]:
-            present[p["id"]][i] = True
+            # v2 пишет все 10 слотов с явным status; запись создаём для любого
+            # слота, а присутствием считаем только active, иначе метрика
+            # presence всегда была бы 100%.
+            mask = present[p["id"]]
+            if p.get("status", "active") == "active":
+                mask[i] = True
     gap_lens: list[int] = []
     for mask in present.values():
         g = 0

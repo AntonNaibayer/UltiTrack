@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 import supervision as sv
 
-from ultitrack.config import PROCESSED_VIDEOS_DIR, RAW_VIDEOS_DIR
+from ultitrack.config import PROCESSED_VIDEOS_DIR, RADAR_USE_SMOOTHING, RAW_VIDEOS_DIR
 from ultitrack.court_mapper import FIELD_L, FIELD_W, CourtMapper
 from ultitrack.detector import PlayerTracker
 from ultitrack.radar import TacticalRadar
@@ -63,7 +63,7 @@ def run_pipeline(video_filename: str) -> None:
 
     print(f"Зафиксировано слотов игроков: {len(roster.slots)}")
 
-    radar = TacticalRadar(width=180, height=360)
+    radar = TacticalRadar(width=180, height=360, use_smoothing=RADAR_USE_SMOOTHING)
     start_time = time.time()
     print(f"Запуск обработки {video_info.total_frames} кадров...")
 
@@ -99,14 +99,15 @@ def run_pipeline(video_filename: str) -> None:
             # Записываем телеметрию для сайта
             roster.record_telemetry(frame_idx, players, coords_2d, disc_2d=None, disc_box=None)
 
-            # Рендерим радар (Передаем статусы!)
-            radar_img = radar.render(coords_2d, radar_ids, radar_status, {}, disc_2d=None, fps=fps)
+            # Рендерим радар (Передаем статусы и карту команд)
+            team_map = roster.get_team_map()
+            radar_img = radar.render(coords_2d, radar_ids, radar_status, team_map, disc_2d=None, fps=fps)
             
             # Рисуем аннотации на кадре
             annotated_frame = tracker.draw_annotations(
                 frame,
                 players,
-                {},
+                team_map,
                 disc_box=None,
             )
 
@@ -145,4 +146,4 @@ def run_pipeline(video_filename: str) -> None:
 
 
 if __name__ == "__main__":
-    run_pipeline("match5.mp4")
+    run_pipeline("match7.mp4")

@@ -10,17 +10,26 @@ import numpy as np
 import supervision as sv
 from scipy.optimize import linear_sum_assignment
 
-from ultitrack.config import ENDZONE_LENGTH, FIELD_LENGTH, FIELD_WIDTH
+from ultitrack.config import (
+    ENDZONE_LENGTH,
+    FIELD_LENGTH,
+    FIELD_WIDTH,
+    TEAM_COLORS_BGR,
+)
 from ultitrack.court_mapper import FIELD_L, FIELD_W, CourtMapper
 
 # ---------- константы ----------
 MAX_SEARCH_M = 3.0           # свежие потери ищем в радиусе 3м
 MAX_SEARCH_LOST_M = 5.0      # если потерян >= 15 кадров, ищем шире
 CROWD_RADIUS_M = 1.5         # перекрытие слотов — пропускаем прямой tracker_id
-CROWD_IOU = 0.05             # IoU выше — бокс считается перекрытым
+CROWD_IOU = 0.05             # в плотной паре слотов прямой матч режем уже при таком IoU
+DIRECT_MATCH_MAX_IOU = 0.45  # обычный порог перекрытия для доверия tracker_id
 
 MAX_PLAYER_SPEED_MPS = 9.5   # физический предел скорости игрока (м/с)
 KALMAN_ACCEL_STD = 4.0       # ожидаемое ускорение/манёвр игрока (м/с^2)
+
+# Коды статуса слота (см. update) -> строки в telemetry v2.
+TELEMETRY_STATUS = {1: "active", 0: "lost", 2: "coasting"}
 
 
 @dataclass
@@ -36,6 +45,7 @@ class PlayerSlot:
     frames_lost: int = 0
     near_edge: bool = False
     team: str = "A"
+    team_conf: float = 0.0
 
     # --- Калман (состояние: [x, y, vx, vy] в метрах и м/с) ---
     kf: cv2.KalmanFilter = field(init=False)
@@ -103,7 +113,8 @@ class RosterTracker:
         self.slot_matched: dict[int, int] = {}
         self.reject_counts: Counter = Counter()
         self.reject_by_slot: dict[int, Counter] = {}
-        self._last_matched_telemetry: list[tuple[int, np.ndarray]] = []
+        # (slot_id, pos_2d, status_code) для ВСЕХ слотов, включая потерянные.
+        self._last_telemetry: list[tuple[int, np.ndarray, int]] = []
 
     def initialize_roster(
         self,
@@ -114,7 +125,7 @@ class RosterTracker:
         self.slots.clear()
         self.telemetry_frames.clear()
         self.review_frames.clear()
-        self._last_matched_telemetry.clear()
+        self._last_telemetry.clear()
 
         if detections.tracker_id is None or len(detections) == 0:
             return
@@ -208,8 +219,10 @@ class RosterTracker:
             if d_idx in used_dets:
                 continue
                 
-            # Разрешаем матчинг при перекрытии до 45% (чтобы не терять в толпе)
-            if max_iou_per_det[d_idx] > 0.45:
+            # В плотной паре слотов доверяем tracker_id только при почти нулевом
+            # перекрытии; иначе отдаём решение венгерскому алгоритму.
+            iou_limit = CROWD_IOU if s_idx in crowded_slots else DIRECT_MATCH_MAX_IOU
+            if max_iou_per_det[d_idx] > iou_limit:
                 continue
 
             pred = slot.pred_pos
@@ -275,7 +288,7 @@ class RosterTracker:
         court_mapper: CourtMapper,
     ) -> tuple[sv.Detections, np.ndarray, np.ndarray, np.ndarray]:
         if not self.slots:
-            self._last_matched_telemetry = []
+            self._last_telemetry = []
             return (
                 sv.Detections.empty(),
                 np.empty((0, 2), dtype=np.float32),
@@ -332,10 +345,15 @@ class RosterTracker:
         else:
             matched_det_indices = {}
 
-        # 3) RESPAWN
+        # 3) Диагностика отказов: почему несопоставленные слоты не взяли
+        # свободные детекции (иначе reject_counts в summarize_stages пуст).
         used_dets = set(matched_det_indices.values())
         spare_idx = [i for i in range(len(detections)) if i not in used_dets]
+        for s_idx, slot in enumerate(self.slots):
+            if s_idx not in matched_det_indices:
+                self._record_reject_simple(slot, spare_idx, det_coords)
 
+        # 4) RESPAWN
         dead_slot_idx = None
         for i, slot in enumerate(self.slots):
             if slot.frames_lost > 150:
@@ -378,13 +396,13 @@ class RosterTracker:
                 spare_idx.remove(d_idx)
                 print(f"[Roster] RESPAWN: Слот #{slot.slot_id} переназначен на игрока ID={slot.tracker_id}")
 
-        # 4) Обновление позиций (без фикса ног, как договорились)
+        # 5) Обновление позиций (без фикса ног, как договорились)
         kept_det_indices: list[int] = []
         matched_slot_ids: list[int] = []
         assigned_slot_ids: list[int] = []
         smoothed_coords: list[np.ndarray] = []
         status_array: list[int] = []
-        self._last_matched_telemetry = []
+        self._last_telemetry = []
 
         for s_idx, slot in enumerate(self.slots):
             if s_idx in matched_det_indices:
@@ -433,8 +451,8 @@ class RosterTracker:
                 matched_slot_ids.append(slot.slot_id)
                 assigned_slot_ids.append(slot.slot_id)
                 smoothed_coords.append(slot.pos_2d.copy())
-                status_array.append(1) 
-                self._last_matched_telemetry.append((slot.slot_id, slot.pos_2d.copy()))
+                status_array.append(1)
+                self._last_telemetry.append((slot.slot_id, slot.pos_2d.copy(), 1))
             else:
                 slot.frames_lost += 1
                 slot.kf.statePost = slot.kf.statePre.copy()
@@ -445,7 +463,9 @@ class RosterTracker:
 
                 smoothed_coords.append(slot.pos_2d.copy())
                 assigned_slot_ids.append(slot.slot_id)
-                status_array.append(2 if slot.frames_lost > 30 else 0)
+                status_code = 2 if slot.frames_lost > 30 else 0
+                status_array.append(status_code)
+                self._last_telemetry.append((slot.slot_id, slot.pos_2d.copy(), status_code))
 
                 if slot.frames_lost > 60:
                     slot.tracker_id = None
@@ -494,18 +514,62 @@ class RosterTracker:
         self.reject_by_slot.setdefault(slot.slot_id, Counter())[reason] += 1
 
     def get_team_map(self) -> dict[int, str]:
-        return {}
+        """slot_id -> "A"/"B".
 
-    def record_telemetry(self, frame_idx, players, coords_2d, disc_2d, disc_box):
+        Пока классификатор команд не подтвердил цвет (team_conf > 0), слот не
+        попадает в карту: радар и аннотации используют нейтральный цвет.
+        """
+        return {
+            slot.slot_id: slot.team
+            for slot in self.slots
+            if slot.team_conf > 0.0
+        }
+
+    def record_telemetry(
+        self,
+        frame_idx,
+        players,
+        coords_2d,
+        disc_2d,
+        disc_box,
+        holder_slot_id: int | None = None,
+    ):
+        """Пишет ВСЕ слоты, включая потерянные (status lost/coasting).
+
+        Раньше сохранялись только слоты, сматченные на текущем кадре, поэтому
+        при перекрытии игрок исчезал из JSON и фишка мигала в 2D-повторе.
+        """
         team_map = self.get_team_map()
+        if self._last_telemetry:
+            snapshot = self._last_telemetry
+        else:
+            # Fallback, если record_telemetry вызван до update().
+            snapshot = [
+                (
+                    slot.slot_id,
+                    slot.pos_2d,
+                    1 if slot.frames_lost == 0 else (2 if slot.frames_lost > 30 else 0),
+                )
+                for slot in self.slots
+            ]
+        slots_by_id = {slot.slot_id: slot for slot in self.slots}
+
         players_list = []
-        for tid_int, pos in self._last_matched_telemetry:
+        for slot_id, pos, status_code in snapshot:
+            slot = slots_by_id.get(slot_id)
+            if slot is None:
+                continue
             players_list.append(
                 {
-                    "id": tid_int,
-                    "team": team_map.get(tid_int, "B"),
+                    "id": slot_id,
+                    "team": team_map.get(slot_id, slot.team),
+                    "team_conf": round(float(slot.team_conf), 2),
                     "x": round(float(pos[0]), 2),
                     "y": round(float(pos[1]), 2),
+                    "vx": round(float(slot.vel_2d[0]), 2),
+                    "vy": round(float(slot.vel_2d[1]), 2),
+                    "status": TELEMETRY_STATUS.get(status_code, "unknown"),
+                    "has_disc": holder_slot_id == slot_id,
                 }
             )
         disc_data = None
@@ -514,6 +578,7 @@ class RosterTracker:
                 "x": round(float(disc_2d[0]), 2),
                 "y": round(float(disc_2d[1]), 2),
                 "state": disc_box[4],
+                "holder_slot_id": holder_slot_id,
             }
         self.telemetry_frames.append(
             {
@@ -527,15 +592,23 @@ class RosterTracker:
     def save_telemetry(self, output_path: Path, point_id: int = 1) -> None:
         payload = {
             "meta": {
+                "schema_version": 2,
                 "point_id": point_id,
                 "fps": round(self.fps, 2),
                 "field": {
-                    "width": FIELD_WIDTH, 
-                    "length": FIELD_LENGTH, 
-                    "endzone": ENDZONE_LENGTH
+                    "width": FIELD_WIDTH,
+                    "length": FIELD_LENGTH,
+                    "endzone": ENDZONE_LENGTH,
+                },
+                "teams": {
+                    "A": {"color_bgr": list(TEAM_COLORS_BGR["A"]), "attack_dir": None},
+                    "B": {"color_bgr": list(TEAM_COLORS_BGR["B"]), "attack_dir": None},
                 },
             },
             "frames": self.telemetry_frames,
+            # События появятся в analytics/events.py (Фаза 3); пустой список
+            # сохраняет форму telemetry v2 уже сейчас.
+            "events": [],
         }
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")

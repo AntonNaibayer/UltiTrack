@@ -1,0 +1,14 @@
+{
+  "name": "indoor_5x5",
+  "field": {
+    "width": 20.0,
+    "length": 41.0,
+    "endzone_length": 7.0
+  },
+  "wall_no_out_margins_m": {
+    "left": 3.0,
+    "right": 0.0,
+    "far": 0.0,
+    "near": 0.0
+  }
+}

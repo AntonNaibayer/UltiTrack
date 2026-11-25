@@ -11,6 +11,8 @@ from ultitrack.config import (
     IMAGE_SIZE,
     MODEL_PATH,
     TARGET_CLASSES,
+    TEAM_COLORS_BGR,
+    UNKNOWN_TEAM_COLOR_BGR,
 )
 from ultitrack.court_mapper import FIELD_L, FIELD_W, CourtMapper
 from ultitrack.particle_filter import DiscParticleFilter
@@ -267,10 +269,10 @@ class PlayerTracker:
             for xyxy, tracker_id in zip(players.xyxy, players.tracker_id):
                 x1, y1, x2, y2 = map(int, xyxy)
                 tid = int(tracker_id)
-                team = player_teams.get(tid, "B")
+                team = player_teams.get(tid)
 
-                color = (255, 100, 0) if team == "A" else (0, 0, 255)
-                label = f"#{tid} {team}"
+                color = TEAM_COLORS_BGR.get(team, UNKNOWN_TEAM_COLOR_BGR)
+                label = f"#{tid}" + (f" {team}" if team else "")
 
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
                 cv2.putText(

@@ -3,7 +3,19 @@ from collections import deque
 import cv2
 import numpy as np
 
-from ultitrack.config import ENDZONE_LENGTH, FIELD_LENGTH, FIELD_WIDTH
+from ultitrack.config import (
+    ENDZONE_LENGTH,
+    FIELD_LENGTH,
+    FIELD_WIDTH,
+    RADAR_SMOOTHING_BETA,
+    RADAR_SMOOTHING_D_CUTOFF,
+    RADAR_SMOOTHING_MIN_CUTOFF,
+    RADAR_SSAA,
+    RADAR_TRAIL_LEN,
+    RADAR_USE_SMOOTHING,
+    TEAM_COLORS_BGR,
+    UNKNOWN_TEAM_COLOR_BGR,
+)
 
 
 class OneEuroFilter:
@@ -56,12 +68,17 @@ class OneEuroFilter:
 
 
 class TacticalRadar:
-    def __init__(self, width: int = 180, height: int = 360, use_smoothing: bool = False) -> None:
+    def __init__(
+        self,
+        width: int = 180,
+        height: int = 360,
+        use_smoothing: bool = RADAR_USE_SMOOTHING,
+    ) -> None:
         self.width = width
         self.height = height
         self.use_smoothing = use_smoothing
 
-        self.ssaa = 3
+        self.ssaa = RADAR_SSAA
         self.w_px = width * self.ssaa
         self.h_px = height * self.ssaa
 
@@ -109,11 +126,15 @@ class TacticalRadar:
                 active_ids.add(tid_int)
 
                 if tid_int not in self.trails:
-                    self.trails[tid_int] = deque(maxlen=15)
+                    self.trails[tid_int] = deque(maxlen=RADAR_TRAIL_LEN)
 
                 if self.use_smoothing:
                     if tid_int not in self.filters:
-                        self.filters[tid_int] = OneEuroFilter(min_cutoff=1.2, beta=0.05, d_cutoff=1.0)
+                        self.filters[tid_int] = OneEuroFilter(
+                            min_cutoff=RADAR_SMOOTHING_MIN_CUTOFF,
+                            beta=RADAR_SMOOTHING_BETA,
+                            d_cutoff=RADAR_SMOOTHING_D_CUTOFF,
+                        )
                     pos = self.filters[tid_int](raw_pos, self.frame_time)
                 else:
                     pos = raw_pos
@@ -125,7 +146,10 @@ class TacticalRadar:
 
                 if status == 1:
                     self.trails[tid_int].append((px, py))
-                    color = (0, 165, 255)
+                    # Цвет фишки и хвоста берём из карты команд; пока классификатор
+                    # не заполнил её, используется нейтральный оранжевый.
+                    team = player_teams.get(tid_int)
+                    color = TEAM_COLORS_BGR.get(team, UNKNOWN_TEAM_COLOR_BGR)
                     for i in range(1, len(self.trails[tid_int])):
                         cv2.line(
                             radar,
