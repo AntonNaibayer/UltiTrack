@@ -164,7 +164,16 @@ class TacticalRadar:
                     cv2.circle(radar, (px, py), 6 * self.ssaa, (255, 255, 255), 1 * self.ssaa, cv2.LINE_AA)
                 else:
                     self.trails[tid_int].clear()
-                    color = (150, 150, 150)
+                    # Потерянный/coasting слот сохраняет цвет команды, но
+                    # рисуется только приглушённым контуром — видно, что
+                    # игрок временно не подтверждён, и за какую он команду.
+                    team = player_teams.get(tid_int)
+                    base_color = TEAM_COLORS_BGR.get(team)
+                    color = (
+                        tuple(int(c * 0.55) for c in base_color)
+                        if base_color is not None
+                        else (150, 150, 150)
+                    )
                     cv2.circle(radar, (px, py), 6 * self.ssaa, color, 1 * self.ssaa, cv2.LINE_AA)
 
                 cv2.putText(

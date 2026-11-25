@@ -11,22 +11,28 @@ import supervision as sv
 from scipy.optimize import linear_sum_assignment
 
 from ultitrack.config import (
+    APPEARANCE_COST_WEIGHT,
+    APPEARANCE_DIRECT_MAX_DIST,
+    APPEARANCE_RADIUS_M,
     ENDZONE_LENGTH,
     FIELD_LENGTH,
     FIELD_WIDTH,
+    PILE_RADIUS_M,
+    RESPAWN_MAX_APPEARANCE_DIST,
     TEAM_COLORS_BGR,
 )
 from ultitrack.court_mapper import FIELD_L, FIELD_W, CourtMapper
 
 # ---------- константы ----------
 MAX_SEARCH_M = 3.0           # свежие потери ищем в радиусе 3м
-MAX_SEARCH_LOST_M = 5.0      # если потерян >= 15 кадров, ищем шире
+MAX_SEARCH_LOST_M = 9.0      # если потерян >= 15 кадров, ищем шире (рывок/уход из кадра)
 CROWD_RADIUS_M = 1.5         # перекрытие слотов — пропускаем прямой tracker_id
 CROWD_IOU = 0.05             # в плотной паре слотов прямой матч режем уже при таком IoU
 DIRECT_MATCH_MAX_IOU = 0.45  # обычный порог перекрытия для доверия tracker_id
 
 MAX_PLAYER_SPEED_MPS = 9.5   # физический предел скорости игрока (м/с)
 KALMAN_ACCEL_STD = 4.0       # ожидаемое ускорение/манёвр игрока (м/с^2)
+RESPAWN_MAX_DIST_M = 8.0     # не подбираем «мёртвый» слот на игрока с другого конца поля
 
 # Коды статуса слота (см. update) -> строки в telemetry v2.
 TELEMETRY_STATUS = {1: "active", 0: "lost", 2: "coasting"}
@@ -101,9 +107,12 @@ class PlayerSlot:
 
 
 class RosterTracker:
-    def __init__(self, fps: float = 30.0) -> None:
+    def __init__(self, fps: float = 30.0, team_classifier: object | None = None) -> None:
         self.fps = fps if fps > 0 else 30.0
         self.slots: list[PlayerSlot] = []
+        # Классификатор команд не участвует в матчинге: он получает уже
+        # сматченные боксы и только заполняет slot.team / slot.team_conf.
+        self.team_classifier = team_classifier
 
         self.telemetry_frames: list[dict] = []
         self.review_frames: list[dict] = []
@@ -113,6 +122,7 @@ class RosterTracker:
         self.slot_matched: dict[int, int] = {}
         self.reject_counts: Counter = Counter()
         self.reject_by_slot: dict[int, Counter] = {}
+        self.pile_coasts: int = 0
         # (slot_id, pos_2d, status_code) для ВСЕХ слотов, включая потерянные.
         self._last_telemetry: list[tuple[int, np.ndarray, int]] = []
 
@@ -126,6 +136,13 @@ class RosterTracker:
         self.telemetry_frames.clear()
         self.review_frames.clear()
         self._last_telemetry.clear()
+        self.pile_coasts = 0
+        if self.team_classifier is not None:
+            try:
+                self.team_classifier.reset()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Roster] Классификатор команд отключён: {exc}")
+                self.team_classifier = None
 
         if detections.tracker_id is None or len(detections) == 0:
             return
@@ -146,6 +163,17 @@ class RosterTracker:
                 )
             )
             slot_num += 1
+
+        # Позиции первого кадра нужны классификатору для проверки стартовой
+        # расстановки: 5 игроков на одной линии эндзоны, 5 — на другой.
+        if self.team_classifier is not None:
+            try:
+                self.team_classifier.set_initial_positions(
+                    {slot.slot_id: slot.pos_2d.copy() for slot in self.slots}
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Roster] Классификатор команд отключён: {exc}")
+                self.team_classifier = None
 
     @staticmethod
     def _compute_box_ious(boxes: np.ndarray) -> np.ndarray:
@@ -193,11 +221,34 @@ class RosterTracker:
 
     @staticmethod
     def _max_search_radius(slot: PlayerSlot) -> float:
+        if slot.frames_lost >= 15:
+            # Постепенно расширяем поиск: после рывка игрок может оказаться
+            # в 7-9 м, но мгновенно искать по всему полю нельзя.
+            return min(MAX_SEARCH_LOST_M, 5.0 + (slot.frames_lost - 15) * 0.08)
         if slot.near_edge:
             return 6.0
-        if slot.frames_lost >= 15:
-            return MAX_SEARCH_LOST_M
         return min(3.0 + slot.frames_lost * 0.4, MAX_SEARCH_M)
+
+    def _appearance_distance(
+        self,
+        slot_index: int,
+        det_index: int,
+        det_features: list[np.ndarray | None] | None,
+    ) -> float | None:
+        """Расстояние между цветом детекции и эталоном слота."""
+        if det_features is None or self.team_classifier is None:
+            return None
+        if not (0 <= det_index < len(det_features)):
+            return None
+        feature = det_features[det_index]
+        if feature is None:
+            return None
+        reference = self.team_classifier.reference_feature(
+            self.slots[slot_index].slot_id
+        )
+        if reference is None:
+            return None
+        return float(np.linalg.norm(feature - reference))
 
     def _match_all(
         self,
@@ -206,9 +257,14 @@ class RosterTracker:
         crowded_slots: set[int],
         max_iou_per_det: np.ndarray,
         in_strict: np.ndarray,
+        appearance_slots: set[int] | None = None,
+        det_features: list[np.ndarray | None] | None = None,
+        lost_slots: set[int] | None = None,
     ) -> dict[int, int]:
         matched: dict[int, int] = {}
         used_dets: set[int] = set()
+        appearance_slots = appearance_slots or set()
+        lost_slots = lost_slots or set()
 
         # Шаг 1: прямой tracker_id
         tid_to_det = {int(tid): idx for idx, tid in enumerate(detections.tracker_id)}
@@ -218,7 +274,18 @@ class RosterTracker:
             d_idx = tid_to_det[slot.tracker_id]
             if d_idx in used_dets:
                 continue
-                
+
+            # В тесной паре слотов не доверяем ByteTrack ID, если цвет
+            # детекции сильно не совпадает с эталоном слота: при пересечении
+            # игроков ID могли поменяться.
+            if s_idx in appearance_slots:
+                app_dist = self._appearance_distance(s_idx, d_idx, det_features)
+                if (
+                    app_dist is not None
+                    and app_dist > APPEARANCE_DIRECT_MAX_DIST
+                ):
+                    continue
+
             # В плотной паре слотов доверяем tracker_id только при почти нулевом
             # перекрытии; иначе отдаём решение венгерскому алгоритму.
             iou_limit = CROWD_IOU if s_idx in crowded_slots else DIRECT_MATCH_MAX_IOU
@@ -265,6 +332,21 @@ class RosterTracker:
                         traj_pen = float(np.linalg.norm(actual_vel - slot.anchor_vel)) * 5.0
 
                     cost = dist * 14.0 + traj_pen
+                    app_dist = (
+                        self._appearance_distance(s_idx, d_idx, det_features)
+                        if (s_idx in appearance_slots or s_idx in lost_slots)
+                        else None
+                    )
+                    # После долгой потери не цепляем игрока с чужим цветом
+                    # формы — иначе он получает не свою команду.
+                    if (
+                        s_idx in lost_slots
+                        and app_dist is not None
+                        and app_dist > RESPAWN_MAX_APPEARANCE_DIST
+                    ):
+                        continue
+                    if s_idx in appearance_slots and app_dist is not None:
+                        cost += app_dist * APPEARANCE_COST_WEIGHT
 
                     if not in_strict[d_idx]:
                         if slot_in:
@@ -333,22 +415,105 @@ class RosterTracker:
 
         # 2) Перекрытия и матчинг
         crowded_slots: set[int] = set()
+        close_slots: set[int] = set()
+        pile_slots: set[int] = set()
+        lost_slots: set[int] = set()
+        blocked_dets: set[int] = set()
         if len(detections) > 0 and detections.tracker_id is not None:
             ious = self._compute_box_ious(detections.xyxy)
             max_iou_per_det = ious.max(axis=1) if len(detections) > 1 else np.zeros(len(detections))
             for i in range(len(self.slots)):
                 for j in range(i + 1, len(self.slots)):
-                    if np.linalg.norm(self.slots[i].pos_2d - self.slots[j].pos_2d) < CROWD_RADIUS_M:
+                    dist = float(
+                        np.linalg.norm(self.slots[i].pos_2d - self.slots[j].pos_2d)
+                    )
+                    if dist < CROWD_RADIUS_M:
                         crowded_slots.add(i)
                         crowded_slots.add(j)
-            matched_det_indices = self._match_all(detections, det_coords, crowded_slots, max_iou_per_det, in_strict)
+                    if dist < APPEARANCE_RADIUS_M:
+                        close_slots.add(i)
+                        close_slots.add(j)
+                    if dist < PILE_RADIUS_M:
+                        pile_slots.add(i)
+                        pile_slots.add(j)
+            lost_slots = {
+                s_idx
+                for s_idx, slot in enumerate(self.slots)
+                if slot.frames_lost >= 15
+            }
+
+            # В тесных парах и после долгой потери сравниваем цвет детекции
+            # с эталоном слота. Это включается только после калибровки команд.
+            det_features: list[np.ndarray | None] | None = None
+            appearance_slots: set[int] = set()
+            if (
+                (close_slots or lost_slots)
+                and self.team_classifier is not None
+                and bool(getattr(self.team_classifier, "calibrated", False))
+            ):
+                try:
+                    det_features = [
+                        self.team_classifier.feature_for_box(frame, box)
+                        for box in detections.xyxy
+                    ]
+                    if any(feature is not None for feature in det_features):
+                        appearance_slots = {
+                            s_idx
+                            for s_idx in (close_slots | lost_slots)
+                            if self.team_classifier.reference_feature(
+                                self.slots[s_idx].slot_id
+                            )
+                            is not None
+                        }
+                    else:
+                        det_features = None
+                except Exception:
+                    det_features = None
+
+            matched_det_indices = self._match_all(
+                detections,
+                det_coords,
+                crowded_slots,
+                max_iou_per_det,
+                in_strict,
+                appearance_slots,
+                det_features,
+                lost_slots,
+            )
+
+            # «Куча»: если двум слотам пришли детекции с другими ByteTrack ID,
+            # не даём им поменяться игроками. Лучше несколько кадров coast,
+            # чем мгновенная смена игрока/команды.
+            if pile_slots and matched_det_indices:
+                filtered: dict[int, int] = {}
+                for s_idx, d_idx in matched_det_indices.items():
+                    slot = self.slots[s_idx]
+                    det_tid = (
+                        int(detections.tracker_id[d_idx])
+                        if detections.tracker_id is not None
+                        else None
+                    )
+                    if (
+                        s_idx in pile_slots
+                        and slot.tracker_id is not None
+                        and det_tid != slot.tracker_id
+                    ):
+                        blocked_dets.add(d_idx)
+                        self.pile_coasts += 1
+                        continue
+                    filtered[s_idx] = d_idx
+                matched_det_indices = filtered
         else:
             matched_det_indices = {}
 
         # 3) Диагностика отказов: почему несопоставленные слоты не взяли
         # свободные детекции (иначе reject_counts в summarize_stages пуст).
         used_dets = set(matched_det_indices.values())
-        spare_idx = [i for i in range(len(detections)) if i not in used_dets]
+        spare_idx = [
+            i
+            for i in range(len(detections))
+            if i not in used_dets and i not in blocked_dets
+        ]
         for s_idx, slot in enumerate(self.slots):
             if s_idx not in matched_det_indices:
                 self._record_reject_simple(slot, spare_idx, det_coords)
@@ -361,19 +526,45 @@ class RosterTracker:
                 break
 
         if dead_slot_idx is not None and spare_idx:
+            dead_slot = self.slots[dead_slot_idx]
             best_spare = None
             best_conf = 0.0
             for d_idx in spare_idx:
-                if in_strict[d_idx]:
-                    conf = float(detections.confidence[d_idx]) if detections.confidence is not None else 1.0
-                    if conf > 0.4 and conf > best_conf:
-                        best_conf = conf
-                        best_spare = d_idx
+                if not in_strict[d_idx]:
+                    continue
+                # Respawn — это локальное восстановление, а не поиск любого
+                # свободного игрока по всему полю. Иначе слот может забрать
+                # игрока другой команды и «сменить команду» на ровном месте.
+                dist = float(np.linalg.norm(det_coords[d_idx] - dead_slot.pred_pos))
+                if dist > RESPAWN_MAX_DIST_M:
+                    continue
+                # Не отдаём слот игроку с явно чужим цветом формы: иначе
+                # после возврата с поля игрок получит команду соседа.
+                if self.team_classifier is not None and bool(
+                    getattr(self.team_classifier, "calibrated", False)
+                ):
+                    reference = self.team_classifier.reference_feature(
+                        dead_slot.slot_id
+                    )
+                    if reference is not None:
+                        feature = self.team_classifier.feature_for_box(
+                            frame, detections.xyxy[d_idx]
+                        )
+                        if (
+                            feature is not None
+                            and float(np.linalg.norm(feature - reference))
+                            > RESPAWN_MAX_APPEARANCE_DIST
+                        ):
+                            continue
+                conf = float(detections.confidence[d_idx]) if detections.confidence is not None else 1.0
+                if conf > 0.4 and conf > best_conf:
+                    best_conf = conf
+                    best_spare = d_idx
 
             if best_spare is not None:
                 d_idx = best_spare
                 new_pos = det_coords[d_idx].copy()
-                slot = self.slots[dead_slot_idx]
+                slot = dead_slot
 
                 slot.tracker_id = int(detections.tracker_id[d_idx])
                 slot.pos_2d = new_pos.copy()
@@ -421,16 +612,24 @@ class RosterTracker:
                 slot.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * (0.20 * dist_scale)
 
                 measurement = np.array([[new_pos[0]], [new_pos[1]]], dtype=np.float32)
+                was_lost_long = slot.frames_lost >= 15
                 slot.kf.correct(measurement)
 
                 slot.pos_2d = slot.kf.statePost[:2].flatten()
 
-                # Лимит шага за кадр
-                step_vec = slot.pos_2d - slot.prev_pos
-                step_dist = float(np.linalg.norm(step_vec))
-                if step_dist > max_step:
-                    slot.pos_2d = slot.prev_pos + (step_vec / step_dist) * max_step
-                    slot.kf.statePost[:2] = slot.pos_2d.reshape(2, 1)
+                if was_lost_long:
+                    # После долгой потери/рывка не растягиваем догон на
+                    # десятки кадров: сразу ставим слот на найденного игрока.
+                    slot.pos_2d = new_pos.copy()
+                    slot.kf.statePost[:2] = new_pos.reshape(2, 1)
+                    slot.kf.statePost[2:4] = 0.0
+                else:
+                    # Лимит шага за кадр
+                    step_vec = slot.pos_2d - slot.prev_pos
+                    step_dist = float(np.linalg.norm(step_vec))
+                    if step_dist > max_step:
+                        slot.pos_2d = slot.prev_pos + (step_vec / step_dist) * max_step
+                        slot.kf.statePost[:2] = slot.pos_2d.reshape(2, 1)
 
                 # Ограничение скорости
                 vel = slot.kf.statePost[2:4].flatten()
@@ -483,6 +682,25 @@ class RosterTracker:
         out_detections = detections[order] if len(order) > 0 else sv.Detections.empty()
         if len(out_detections) > 0:
             out_detections.tracker_id = np.array(matched_slot_ids, dtype=int)
+
+        # Классификация команд — строго после матчинга и обновления позиций.
+        # Ошибка классификатора не должна ломать трекинг: отключаем его и
+        # продолжаем с нейтральными цветами.
+        if self.team_classifier is not None:
+            try:
+                slot_boxes = {
+                    self.slots[s_idx].slot_id: detections.xyxy[d_idx].copy()
+                    for s_idx, d_idx in matched_det_indices.items()
+                }
+                assignments = self.team_classifier.update(frame, slot_boxes)
+                for slot in self.slots:
+                    assignment = assignments.get(slot.slot_id)
+                    if assignment is not None:
+                        slot.team = assignment.team
+                        slot.team_conf = float(assignment.confidence)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Roster] Классификатор команд отключён: {exc}")
+                self.team_classifier = None
 
         return (
             out_detections,
@@ -559,10 +777,12 @@ class RosterTracker:
             slot = slots_by_id.get(slot_id)
             if slot is None:
                 continue
+            # team_map содержит только слоты с подтверждённой командой
+            # (team_conf > 0). До калибровки пишем null, а не ложную "A".
             players_list.append(
                 {
                     "id": slot_id,
-                    "team": team_map.get(slot_id, slot.team),
+                    "team": team_map.get(slot_id),
                     "team_conf": round(float(slot.team_conf), 2),
                     "x": round(float(pos[0]), 2),
                     "y": round(float(pos[1]), 2),
@@ -662,3 +882,8 @@ def summarize_stages(stage_log: list[dict], n_slots: int, roster: "RosterTracker
             print("  Почему слот не взял детекцию:")
             for reason, n in roster.reject_counts.most_common():
                 print(f"    {reason:<20} {n:>6}  ({n / total_rej:.0%})")
+        if roster.pile_coasts:
+            print(
+                "  Pile ID-change coast: "
+                f"{roster.pile_coasts} кадров (смена tracker_id в куче отложена)"
+            )

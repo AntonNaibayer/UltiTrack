@@ -1,3 +1,4 @@
+import argparse
 import time
 from pathlib import Path
 
@@ -5,14 +6,24 @@ import cv2
 import numpy as np
 import supervision as sv
 
-from ultitrack.config import PROCESSED_VIDEOS_DIR, RADAR_USE_SMOOTHING, RAW_VIDEOS_DIR
+from ultitrack.config import (
+    PROCESSED_VIDEOS_DIR,
+    RADAR_USE_SMOOTHING,
+    RAW_VIDEOS_DIR,
+    TEAM_CALIBRATION_SECONDS,
+    TEAM_CLASSIFIER_ENABLED,
+    TEAM_MIN_OBSERVATIONS,
+)
 from ultitrack.court_mapper import FIELD_L, FIELD_W, CourtMapper
 from ultitrack.detector import PlayerTracker
 from ultitrack.radar import TacticalRadar
 from ultitrack.roster_tracker import RosterTracker, summarize_stages
+from ultitrack.team_classifier import TeamClassifier
 
 
-def run_pipeline(video_filename: str) -> None:
+def run_pipeline(
+    video_filename: str, use_team_classifier: bool = True
+) -> None:
     source_path = RAW_VIDEOS_DIR / video_filename
     target_path = PROCESSED_VIDEOS_DIR / f"tracked_{video_filename}"
     telemetry_path = PROCESSED_VIDEOS_DIR / f"telemetry_{Path(video_filename).stem}.json"
@@ -58,7 +69,18 @@ def run_pipeline(video_filename: str) -> None:
 
     initial_coords_2d = court_mapper.transform_to_2d(field_players)
 
-    roster = RosterTracker(fps=fps)
+    team_classifier = None
+    if use_team_classifier and TEAM_CLASSIFIER_ENABLED:
+        calibration_frames = max(
+            TEAM_MIN_OBSERVATIONS, int(round(fps * TEAM_CALIBRATION_SECONDS))
+        )
+        team_classifier = TeamClassifier(calibration_frames=calibration_frames)
+        print(
+            f"[TeamClassifier] Калибровка 5x5 по первым ~{calibration_frames} кадрам "
+            f"({TEAM_CALIBRATION_SECONDS:.1f} с)."
+        )
+
+    roster = RosterTracker(fps=fps, team_classifier=team_classifier)
     roster.initialize_roster(first_frame, field_players, initial_coords_2d)
 
     print(f"Зафиксировано слотов игроков: {len(roster.slots)}")
@@ -145,5 +167,24 @@ def run_pipeline(video_filename: str) -> None:
     summarize_stages(stage_log, len(roster.slots), roster)
 
 
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="UltiTrack: трекинг 10 слотов и 2D-радар по видео матча."
+    )
+    parser.add_argument(
+        "video",
+        nargs="?",
+        default="match7.mp4",
+        help="имя файла в data/raw (по умолчанию match7.mp4)",
+    )
+    parser.add_argument(
+        "--no-team-classifier",
+        action="store_true",
+        help="не запускать классификатор команд (цвета останутся нейтральными)",
+    )
+    args = parser.parse_args()
+    run_pipeline(args.video, use_team_classifier=not args.no_team_classifier)
+
+
 if __name__ == "__main__":
-    run_pipeline("match7.mp4")
+    main()
