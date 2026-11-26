@@ -508,6 +508,21 @@ class CourtMapper:
         self.homography_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
         print(f"[CourtMapper] Гомография сохранена: {self.homography_path}")
 
+    def load_saved_homography(self, frame_size: tuple[int, int] | None = None) -> bool:
+        """Загружает calib/homography.json без интерактивной калибровки.
+
+        Нужен фоновым пайплайнам (например, экспорту в CVAT), где нельзя
+        открывать окно выбора точек. Если размер кадра не совпадает с
+        сохранённым, возвращает False — лучше отключить фильтр поля, чем
+        применять чужую гомографию.
+        """
+        if frame_size is not None:
+            self.frame_size = (int(frame_size[0]), int(frame_size[1]))
+        if self.frame_size is None:
+            print("[CourtMapper] frame_size не задан — гомография не загружена.")
+            return False
+        return self._load_homography()
+
     def _load_homography(self) -> bool:
         if not self.homography_path.exists():
             return False
